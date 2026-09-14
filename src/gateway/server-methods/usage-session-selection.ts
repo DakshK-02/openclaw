@@ -201,7 +201,11 @@ export async function selectUsageSessions(params: {
     visibilityFilter,
   } = params;
   // Load session store for named sessions only on a result-cache miss.
-  const sessionStoreOpts = effectiveAgentId ? { agentId: effectiveAgentId } : {};
+  // contextWeight is read straight off systemPromptReport, so this consumer opts
+  // into the full projection now that store-wide reads default to "list".
+  const sessionStoreOpts = effectiveAgentId
+    ? { agentId: effectiveAgentId, projection: "full" as const }
+    : { projection: "full" as const };
   const { store, agentIdBySessionKey } = loadCombinedSessionStoreForGatewayCore(
     config,
     sessionStoreOpts,

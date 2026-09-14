@@ -26,7 +26,13 @@ export function loadCombinedSessionStoreForGateway(
   cfg: OpenClawConfig,
   opts: { agentId?: string; configuredAgentsOnly?: boolean } = {},
 ) {
-  const result = loadGatewaySessionStore(cfg, { ...opts, includeIncognito: false });
+  // The published SDK view exposes saved prompt payloads, so it opts in; a caller
+  // supplying its own projection still wins.
+  const result = loadGatewaySessionStore(cfg, {
+    projection: "full",
+    ...opts,
+    includeIncognito: false,
+  });
   return {
     storePath: result.storePath,
     // Plugin search hits can be re-persisted into durable transcripts, so the
