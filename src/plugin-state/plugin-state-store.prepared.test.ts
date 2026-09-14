@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getNodeSqliteKysely } from "../infra/kysely-sync.js";
+import { closeOpenClawStateDatabaseByPath } from "../state/openclaw-state-db-cache.js";
 import {
-  closeOpenClawStateDatabaseByPath,
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
 } from "../state/openclaw-state-db.js";
@@ -10,11 +10,11 @@ import {
   type OpenClawTestState,
 } from "../test-utils/openclaw-test-state.js";
 import {
-  closePluginStateDatabase,
   createPluginStateSyncKeyedStore,
   resetPluginStateStoreForTests,
 } from "./plugin-state-store.js";
 import { lookupPluginStateEntry, registerPluginStateEntry } from "./plugin-state-store.kernel.js";
+import { closePluginStateDatabase } from "./plugin-state-store.sqlite.js";
 import {
   clearPluginStateStoreForTests,
   seedPluginStateEntriesForTests,
@@ -119,10 +119,14 @@ describe("plugin state prepared queries", () => {
     }
   });
 
-  it.each(["register", "registerIfAbsent"] as const)(
-    "reuses %s write and quota compilation with fresh bindings after reopening",
-    (operation) => {
-      const options = { namespace: "prepared-writes", maxEntries: 20 };
+  it.each([
+    ["register", "evict-oldest"],
+    ["register", "reject-new"],
+    ["registerIfAbsent", "evict-oldest"],
+  ] as const)(
+    "reuses %s %s write and quota compilation with fresh bindings after reopening",
+    (operation, overflowPolicy) => {
+      const options = { namespace: "prepared-writes", maxEntries: 20, overflowPolicy };
       const stores = [
         createPluginStateSyncKeyedStore<string>("discord", options),
         createPluginStateSyncKeyedStore<string>("telegram", options),

@@ -720,6 +720,15 @@ describe("frozen admission entry", () => {
     { name: "legacy authorized", files: {}, allow: true, mode: "unsupported" },
     { name: "legacy strict", files: {}, allow: false, mode: "required" },
     {
+      name: "parsed-duration legacy authorized",
+      files: {
+        "src/config/zod-schema.session.ts":
+          "export const SessionSchema = z.object({ maintenance: z.object({ pruneAfter: z.union([z.string(), z.number()]).optional() }) });",
+      },
+      allow: true,
+      mode: "unsupported",
+    },
+    {
       name: "current authorized",
       files: { "src/config/zod-schema.session-config.ts": "coldStorage: z.object({})" },
       allow: true,
@@ -786,6 +795,7 @@ describe("frozen admission entry", () => {
       expect(JSON.parse(result.stdout).contracts[0].files).toEqual([
         { source: "selected", path: scenario },
         { source: "tooling", path: "scripts/e2e/lib/release-scenarios/assertions.mjs" },
+        { source: "tooling", path: "scripts/e2e/lib/release-assertion-files.mjs" },
         { source: "tooling", path: "scripts/e2e/lib/fixtures/mock-openai-config.mjs" },
       ]);
     },
