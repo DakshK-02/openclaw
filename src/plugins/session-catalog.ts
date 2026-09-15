@@ -233,6 +233,15 @@ export type SessionCatalogProvider = {
 type SessionCatalogAdoptedSource = { hostId: string; threadId: string };
 type SessionCatalogEntry = SessionCatalogEntrySummary["entry"];
 
+/**
+ * Lists catalog-visible session rows as metadata-only entries.
+ *
+ * Both paths — the Gateway-supplied `sessionEntries` snapshot and the direct-listing
+ * fallback — omit `skillsSnapshot` and `systemPromptReport`. Catalog adoption and
+ * ownership matching read identity, harness, ownership, `pluginExtensions` and
+ * lifecycle fields only. Consumers needing a saved prompt payload must read that one
+ * session with a keyed `getSessionEntry(...)`, and must never write a listed entry back.
+ */
 export function listSessionCatalogEntries(params: {
   agentId?: string;
   config: OpenClawConfig;
