@@ -182,14 +182,14 @@ describe("listSessionCatalogEntries", () => {
 
     for (const entries of [fallback, snapshot]) {
       expect(entries).toHaveLength(1);
-      const entry = entries[0]?.entry as Record<string, unknown>;
-      expect(entry.skillsSnapshot).toBeUndefined();
-      expect(entry.systemPromptReport).toBeUndefined();
+      const entry = entries[0]?.entry;
+      expect(entry?.skillsSnapshot).toBeUndefined();
+      expect(entry?.systemPromptReport).toBeUndefined();
       // Fields catalog adoption and ownership matching actually read must survive.
-      expect(entry.sessionId).toBe("session-1");
-      expect(entry.agentHarnessId).toBe("codex");
-      expect(entry.modelSelectionLocked).toBe(true);
-      expect(entry.pluginExtensions).toEqual(storedEntry.pluginExtensions);
+      expect(entry?.sessionId).toBe("session-1");
+      expect(entry?.agentHarnessId).toBe("codex");
+      expect(entry?.modelSelectionLocked).toBe(true);
+      expect(entry?.pluginExtensions).toEqual(storedEntry.pluginExtensions);
     }
   });
 });

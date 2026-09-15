@@ -2,6 +2,7 @@ import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
+import { resolveSessionStorePathForAcp } from "../../../acp/runtime/session-meta-store.js";
 import { readAcpSessionMetaForEntry } from "../../../acp/runtime/session-meta.js";
 import { resolveSessionStorePathCore } from "../../../config/sessions/paths.js";
 import {
@@ -221,12 +222,14 @@ export function validateAcpResumeSessionOwnership(params: {
     clone: false,
     projection: "list",
   })) {
-    // The listed row already carries the binding fields this lookup needs
-    // (lifecycleRevision/sessionId/sessionStartedAt); re-reading each key would
-    // decode one complete entry per stored session.
+    // Resolve the ACP owner exactly as the keyed read does — the agent id is part of
+    // the ACP database key, so it cannot be assumed to be the target agent — but supply
+    // the already-listed row as the binding instead of decoding one complete stored
+    // entry per session just to read lifecycleRevision/sessionId/sessionStartedAt.
+    const acpOwner = resolveSessionStorePathForAcp({ sessionKey, cfg: params.cfg });
     const acp = readAcpSessionMetaForEntry({
-      sessionKey,
-      agentId: params.targetAgentId,
+      sessionKey: acpOwner.storeSessionKey,
+      agentId: acpOwner.agentId,
       cfg: params.cfg,
       entry,
     });
