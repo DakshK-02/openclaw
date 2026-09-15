@@ -2,6 +2,8 @@ import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { resolveAgentRunSessionTarget } from "../../agents/run-session-target.js";
+import { validateAcpResumeSessionOwnership } from "../../agents/subagents/spawn/acp-spawn-requester.js";
+import { resolveMemorySessionTargets } from "../../plugin-sdk/memory-core-host-engine-sessions.js";
 import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.js";
 import type { OpenClawConfig } from "../types.openclaw.js";
 import { formatSqliteSessionFileMarker } from "./legacy-sqlite-marker.js";
@@ -117,4 +119,30 @@ it("lists transcript instances at the list projection without prompts, keeping f
     { includeAllWindows: true },
   );
   expect(full.some((instance) => instance.entry.skillsSnapshot?.prompt === PROMPT)).toBe(true);
+});
+
+it("scans ACP resume ownership without parsing saved prompts", async () => {
+  const storePath = seedStore(25);
+  warmCanonicalValidation(storePath);
+  // No stored session records this resume id, so the scan walks every row before refusing.
+  const { result, promptParses } = await countPromptParses(() =>
+    validateAcpResumeSessionOwnership({
+      cfg: { session: { store: storePath } } as OpenClawConfig,
+      targetAgentId: "main",
+      requesterSessionKey: "agent:main:listing-0",
+      resumeSessionId: "unrecorded-resume-id",
+    }),
+  );
+  expect(result.ok).toBe(false);
+  // The listing and the per-row ACP metadata lookup must both stay metadata-only.
+  expect(promptParses).toBe(0);
+});
+
+it("resolves memory session targets without parsing saved prompts", async () => {
+  const storePath = seedStore(25);
+  warmCanonicalValidation(storePath);
+  const { promptParses } = await countPromptParses(() =>
+    resolveMemorySessionTargets({ agentId: "main", storePath, sessionIds: ["listing-9"] }),
+  );
+  expect(promptParses).toBe(0);
 });
