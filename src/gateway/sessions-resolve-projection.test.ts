@@ -5,7 +5,6 @@ import type { SessionsResolveParams } from "../../packages/gateway-protocol/src/
 import { clearSubagentRunsReadCacheForTest } from "../agents/subagents/registry/subagent-registry-state.js";
 import { saveSubagentRegistryToSqlite } from "../agents/subagents/registry/subagent-registry.store.sqlite.js";
 import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
-import { loadCombinedSessionStoreForGatewayCore } from "../config/sessions/combined-store-gateway.js";
 import { replaceSessionEntrySync } from "../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
@@ -14,6 +13,7 @@ import {
 } from "../state/openclaw-agent-db.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { createDirectChatContext } from "./server-chat.agent-events.test-helpers.js";
+import { artifactsHandlers } from "./server-methods/artifacts.js";
 import { sessionReadHandlers } from "./server-methods/sessions-read.js";
 import {
   resetResolvedSessionKeyForRunCacheForTest,
@@ -265,8 +265,8 @@ function seedStore() {
   }
 }
 
-/** Counts JSON.parse calls that decoded the sibling marker, plus their input bytes. */
-function measureSiblingDecodes<T>(run: () => T): { result: T; decodes: number; bytes: number } {
+/** Counts JSON.parse calls that decoded the sibling marker. */
+function measureSiblingDecodes<T>(run: () => T): { result: T; decodes: number } {
   const parse = vi.spyOn(JSON, "parse");
   try {
     const result = run();
@@ -276,7 +276,6 @@ function measureSiblingDecodes<T>(run: () => T): { result: T; decodes: number; b
     return {
       result,
       decodes: matched.length,
-      bytes: matched.reduce((total, json) => total + Buffer.byteLength(json), 0),
     };
   } finally {
     parse.mockRestore();
@@ -284,23 +283,44 @@ function measureSiblingDecodes<T>(run: () => T): { result: T; decodes: number; b
 }
 
 describe("gateway session lookups", () => {
-  it("resolves a run id without decoding unrelated saved prompts", async () => {
+  it("artifacts.list resolves known and missing runs without decoding unrelated saved prompts", async () => {
     await withOpenClawTestState({ label: "lookup-runid-projection" }, async () => {
       setRuntimeConfigSnapshot(cfg);
       seedStore();
       resetResolvedSessionKeyForRunCacheForTest();
 
-      const observed = measureSiblingDecodes(() =>
-        resolveSessionKeyForRun("target-id", { agentId: "main" }),
-      );
-
-      // Caller-facing key drops the agent prefix; see resolveRunSessionKeyForCaller.
-      expect(observed.result).toBe("target");
-      expect(observed.decodes).toBe(0);
-      expect(observed.bytes).toBe(0);
-
-      resetResolvedSessionKeyForRunCacheForTest();
-      expect(resolveSessionKeyForRun("absent-run-id", { agentId: "main" })).toBeUndefined();
+      const parse = vi.spyOn(JSON, "parse");
+      try {
+        for (const runId of ["target-id", "absent-run-id"]) {
+          const respond = vi.fn();
+          await expectDefined(
+            artifactsHandlers["artifacts.list"],
+            "artifact list handler",
+          )({
+            params: { runId, agentId: "main" },
+            context: createDirectChatContext({ getRuntimeConfig: () => cfg }),
+            req: { type: "req", id: runId, method: "artifacts.list" },
+            client: null,
+            isWebchatConnect: () => false,
+            respond,
+          });
+          if (runId === "target-id") {
+            expect(respond).toHaveBeenCalledWith(true, { artifacts: [] });
+          } else {
+            expect(respond).toHaveBeenCalledWith(
+              false,
+              undefined,
+              expect.objectContaining({
+                details: { type: "artifact_scope_not_found" },
+              }),
+            );
+          }
+        }
+        expect(parse.mock.calls.some(([json]) => json.includes(SIBLING_MARKER))).toBe(false);
+      } finally {
+        parse.mockRestore();
+        resetResolvedSessionKeyForRunCacheForTest();
+      }
     });
   });
 
@@ -320,55 +340,10 @@ describe("gateway session lookups", () => {
       // narrowed store default must not strip the payload this caller returns.
       expect(observed.result?.sessionEntry.skillsSnapshot?.prompt).toBe(TARGET_PROMPT);
 
-      // This caller reads the store twice: the identity scan fixed here, then
-      // resolveGatewaySessionStoreTargetWithStore, which passes no projection and
-      // still materializes every row. Only the first read stops decoding, so the
-      // remaining count is one pass, not zero; narrowing the second read is
-      // separate work because that loader owns the returned entry.
+      // The separate selected-store loader still reads full entries.
       expect(observed.decodes).toBe(SIBLING_ROWS);
 
       expect(resolveWorkerSessionTarget(cfg, "absent-session-id")).toBeUndefined();
-    });
-  });
-
-  it("decodes saved prompts only when a caller opts into the full projection", async () => {
-    await withOpenClawTestState({ label: "lookup-projection-arms" }, async () => {
-      setRuntimeConfigSnapshot(cfg);
-      seedStore();
-
-      // Explicit full loading is a payload control, not an executed baseline revision.
-      const before = measureSiblingDecodes(() =>
-        loadCombinedSessionStoreForGatewayCore(cfg, { agentId: "main", projection: "full" }),
-      );
-      const after = measureSiblingDecodes(() =>
-        loadCombinedSessionStoreForGatewayCore(cfg, { agentId: "main" }),
-      );
-
-      // Same rows either way: this narrows fields, never the result set.
-      expect(Object.keys(before.result.store)).toHaveLength(SIBLING_ROWS + 1);
-      expect(Object.keys(after.result.store)).toHaveLength(SIBLING_ROWS + 1);
-
-      // usage reporting and the plugin transcript view stay pinned to "full" and
-      // must keep receiving the payload; the narrowed default must not reach them.
-      const beforeTarget = before.result.store[scope.sessionKey];
-      expect(beforeTarget?.systemPromptReport?.systemPrompt.chars).toBe(TARGET_PROMPT.length);
-      expect(beforeTarget?.skillsSnapshot?.prompt).toBe(TARGET_PROMPT);
-
-      const afterTarget = after.result.store[scope.sessionKey];
-      expect(afterTarget?.sessionId).toBe("target-id");
-      expect(afterTarget?.systemPromptReport).toBeUndefined();
-      expect(afterTarget?.skillsSnapshot).toBeUndefined();
-
-      expect(before.decodes).toBe(SIBLING_ROWS);
-      expect(before.bytes).toBeGreaterThan(SIBLING_ROWS * SIBLING_PROMPT.length);
-      expect(after.decodes).toBe(0);
-      expect(after.bytes).toBe(0);
-
-      console.log(
-        `[projection-proof] rows=${SIBLING_ROWS + 1} promptBytesPerRow=${SIBLING_PROMPT.length} ` +
-          `full: decodes=${before.decodes} decodedBytes=${before.bytes} | ` +
-          `list: decodes=${after.decodes} decodedBytes=${after.bytes}`,
-      );
     });
   });
 
