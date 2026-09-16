@@ -132,13 +132,24 @@ function evaluateWorkflowExpression(
   expression: unknown,
   context: {
     action?: string;
+    actor?: string;
+    githubEvent?: Record<string, unknown>;
+    maintainerCommands?: string;
     // Runner routing keys off contributor trust, so pull-request cases default
     // to CONTRIBUTOR: same-repo PRs always come from someone with write access.
     authorAssociation?: string;
     cancelled?: boolean;
     dispatchId?: string;
     draft?: boolean;
-    eventName: "pull_request" | "push" | "workflow_dispatch" | "repository_dispatch" | "schedule";
+    eventName:
+      | "pull_request"
+      | "pull_request_target"
+      | "issue_comment"
+      | "issues"
+      | "push"
+      | "workflow_dispatch"
+      | "repository_dispatch"
+      | "schedule";
     failed?: boolean;
     env?: Record<string, string>;
     frozenTarget?: boolean;
@@ -210,6 +221,7 @@ function evaluateWorkflowExpression(
     startsWith: (value: unknown, prefix: unknown) => String(value).startsWith(String(prefix)),
     toJson: (value: unknown) => JSON.stringify(value),
     github: {
+      actor: context.actor ?? "",
       event_name: context.eventName,
       repository: context.repository,
       ref: context.ref ?? "refs/heads/main",
@@ -221,7 +233,8 @@ function evaluateWorkflowExpression(
       workflow_sha: context.workflowSha,
       token: context.workflowToken,
       event:
-        context.headRepository || context.eventName === "pull_request"
+        context.githubEvent ??
+        (context.headRepository || context.eventName === "pull_request"
           ? {
               action: context.action,
               pull_request: {
@@ -234,7 +247,7 @@ function evaluateWorkflowExpression(
                 },
               },
             }
-          : {},
+          : {}),
     },
     inputs: {
       dispatch_id: context.dispatchId ?? "",
@@ -261,6 +274,7 @@ function evaluateWorkflowExpression(
       },
     },
     vars: {
+      MAINTAINER_COMMAND_REACTIONS: context.maintainerCommands ?? "",
       OPENCLAW_CI_RUNNER_BACKEND: context.runnerBackend ?? "",
     },
   });
@@ -270,7 +284,9 @@ function runCiGateFixture(jobResults: string) {
   const gateStep = readCiWorkflow().jobs["ci-gate"].steps.find(
     (step: WorkflowStep) => step.name === "Verify selected CI lanes",
   );
-  return spawnSync("bash", ["-c", gateStep.run], {
+  // Homebrew Bash 5.3 can block writing this here-string before its reader starts.
+  const bash = process.platform === "darwin" ? "/bin/bash" : "bash";
+  return spawnSync(bash, ["-c", gateStep.run], {
     encoding: "utf8",
     env: {
       ...process.env,
@@ -337,7 +353,9 @@ function runPreflightNodeInvocation(
     '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$OPENCLAW_NODE_ARGS"\ncat >/dev/null\n',
   );
   chmodSync(nodePath, 0o755);
-  const result = spawnSync("bash", ["-c", script], {
+  // Avoid Darwin Bash 5.3 heredoc deadlocks while preserving the PATH node spy.
+  const bash = process.platform === "darwin" ? "/bin/bash" : "bash";
+  const result = spawnSync(bash, ["-c", script], {
     encoding: "utf8",
     env: {
       ...process.env,
@@ -2799,6 +2817,130 @@ NODE
     );
   });
 
+  it.each([
+    // name, body, override, permission, issue, admitted, reacts
+    ["plain", "Thanks", "", "write", false, false, false],
+    ["empty", "", "", "write", false, false, false],
+    ["multiline", "context\r\n \t/merge now \r\n", "", "write", false, true, true],
+    ["slash nonmatch", "/landscape", "", "write", false, true, false],
+    ["custom words", "ship it now", " ship it ,", "write", false, true, true],
+    ["custom Unicode", "  ✅ later  ", "✅", "write", false, true, true],
+    ["false override", "false", "false", "write", false, true, true],
+    ["zero override", "0", "0", "write", false, true, true],
+    ["empty parsed override", "Thanks", " , ", "write", false, true, false],
+    ["non-maintainer", "/merge", "", "read", false, true, false],
+    ["issue autoclose", "/autoclose reason", "", "write", true, true, true],
+    ["issue non-autoclose", "/merge", "", "write", true, true, false],
+  ] as const)(
+    "preserves reaction admission and actions for %s",
+    async (_name, body, commands, permission, issue, admitted, reacts) => {
+      const job = readWorkflow(".github/workflows/maintainer-command-reactions.yml").jobs.react;
+      const event = {
+        comment: { id: 456, body, user: { login: "comment-author" } },
+        issue: { number: 123, ...(issue ? {} : { pull_request: {} }) },
+      };
+      const context = {
+        repository: "openclaw/openclaw",
+        runAttempt: 1,
+        eventName: "issue_comment" as const,
+        actor: "event-actor",
+        githubEvent: event,
+        maintainerCommands: commands,
+      };
+      const reactions: string[] = [];
+      const permissionUsers: string[] = [];
+      const step = job.steps.find((candidate: WorkflowStep) => candidate.with?.script);
+      await runInNewContext(`(async () => { ${step.with.script} })()`, {
+        context: { payload: event, repo: { owner: "openclaw", repo: "openclaw" } },
+        process: {
+          env: {
+            MAINTAINER_COMMAND_REACTIONS: evaluateWorkflowExpression(
+              job.env.MAINTAINER_COMMAND_REACTIONS,
+              context,
+            ),
+          },
+        },
+        core: { info() {}, warning() {} },
+        github: {
+          rest: {
+            repos: {
+              async getCollaboratorPermissionLevel({ username }: { username: string }) {
+                permissionUsers.push(username);
+                return { data: { permission } };
+              },
+            },
+            reactions: {
+              async createForIssueComment({ content }: { content: string }) {
+                reactions.push(content);
+              },
+            },
+          },
+        },
+      });
+      expect(reactions).toEqual(reacts ? ["eyes"] : []);
+      expect(permissionUsers.every((login) => login === "comment-author")).toBe(true);
+      expect(Boolean(evaluateWorkflowExpression(job.if, context))).toBe(admitted);
+    },
+  );
+
+  it("keeps reaction admission open for every configured default and closed for bot actors", () => {
+    const workflow = readWorkflow(".github/workflows/maintainer-command-reactions.yml");
+    const job = workflow.jobs.react;
+    const context = {
+      repository: "openclaw/openclaw",
+      runAttempt: 1,
+      eventName: "issue_comment" as const,
+      actor: "maintainer",
+    };
+    const defaults = String(
+      evaluateWorkflowExpression(job.env.MAINTAINER_COMMAND_REACTIONS, context),
+    );
+    for (const command of defaults.split(",")) {
+      // A future nonslash default would invalidate the necessary-character admission guard.
+      expect(command, "default commands must retain slash admission").toContain("/");
+      const githubEvent = { comment: { body: `earlier line\n  ${command} args  ` } };
+      expect(evaluateWorkflowExpression(job.if, { ...context, githubEvent })).toBe(true);
+      expect(
+        evaluateWorkflowExpression(job.if, {
+          ...context,
+          githubEvent,
+          actor: "automation[bot]",
+          maintainerCommands: "ship",
+        }),
+      ).toBe(false);
+    }
+    expect(workflow.on.issue_comment.types).toEqual(["created", "edited"]);
+  });
+
+  it.each([
+    ["issue_comment", "created", "Bot", "human", false],
+    ["issue_comment", "created", "User", "clawsweeper[bot]", true],
+    ["issue_comment", "created", undefined, "human", true],
+    ["issues", "opened", "Bot", "clawsweeper[bot]", true],
+    ["pull_request_target", "opened", "Bot", "clawsweeper[bot]", true],
+    ["pull_request_target", "labeled", "Bot", "clawsweeper[bot]", false],
+    ["pull_request_target", "unlabeled", "Bot", "openclaw-clawsweeper[bot]", false],
+    ["pull_request_target", "labeled", "Bot", "openclaw-barnacle[bot]", true],
+    ["pull_request_target", "labeled", "User", "maintainer", true],
+  ] as const)(
+    "preserves Barnacle comment admission for %s/%s/%s/%s",
+    (eventName, action, type, actor, admitted) => {
+      const job = readWorkflow(".github/workflows/auto-response.yml").jobs["auto-response"];
+      expect(
+        evaluateWorkflowExpression(job.if, {
+          repository: "openclaw/openclaw",
+          runAttempt: 1,
+          eventName,
+          actor,
+          githubEvent: {
+            action,
+            comment: { body: "testflight @openclaw/maintainer", user: { type } },
+          },
+        }),
+      ).toBe(admitted);
+    },
+  );
+
   it("isolates auto-response per item and ignores ClawSweeper PR label feedback", () => {
     const workflow = readWorkflow(".github/workflows/auto-response.yml");
     const guard = workflow.jobs["auto-response"].if;
@@ -3076,12 +3218,17 @@ NODE
               ],
             }
           : {
-              smoke: ["Swift lint", "Build iOS app"],
+              smoke: [
+                "Swift lint",
+                "Build iOS app",
+                ...(historical ? [] : ["Run focused iOS voice cleanup simulator tests"]),
+              ],
               release: ["Build iOS app (Release)"],
               tests: [
                 "Test Watch RTC engine",
                 "Swift lint",
                 "Build iOS app",
+                "Run focused iOS voice cleanup simulator tests",
                 "Run focused iOS lifecycle simulator tests",
                 "Run focused Apple Watch operation simulator tests",
               ],
@@ -4873,6 +5020,24 @@ require("node:fs").writeFileSync("scheduler-baseline", process.env.OPENCLAW_UPGR
       distribution: "temurin",
       "java-version": 17,
     });
+    expect(javaStep.with?.["set-default"]).not.toBe(false);
+    const gradleJavaStep = expectDefined(
+      action.runs.steps.find((step: WorkflowStep) => step.name === "Setup Gradle Java"),
+      "Gradle Java setup step",
+    );
+    expect(gradleJavaStep).toMatchObject({
+      id: "gradle-java",
+      uses: javaStep.uses,
+      with: {
+        distribution: "temurin",
+        "java-version": "21.0.12+101.0.LTS",
+        "set-default": false,
+      },
+    });
+    expect(action.outputs["gradle-java-home"].value).toBe("${{ steps.gradle-java.outputs.path }}");
+    expect(action.outputs["gradle-java-version"].value).toBe(
+      "${{ steps.gradle-java.outputs.version }}",
+    );
     expect(action.inputs["cache-mode"].default).toBe("off");
     expect(sdkRestoreStep.if).toBe("inputs.cache-mode != 'off'");
     expect(sdkRestoreStep.uses).toBe(CACHE_V5);
@@ -5403,6 +5568,29 @@ require("node:fs").writeFileSync("scheduler-baseline", process.env.OPENCLAW_UPGR
       const root = tempDirs.make("openclaw-android-tier-");
       const callsPath = path.join(root, "gradle-calls.jsonl");
       const clockPath = path.join(root, "clock-reads.jsonl");
+      const gradleJavaHome = path.join(root, "gradle jdk");
+      const action = readAndroidToolchainAction();
+      const setupStep: WorkflowStep = expectDefined(
+        readCiWorkflow().jobs.android.steps.find(
+          (candidate: WorkflowStep) => candidate.name === "Setup Android toolchain",
+        ),
+        "Android toolchain setup",
+      );
+      const gradleJavaOutputs = {
+        path: gradleJavaHome,
+        version: "21.0.12+101.0.LTS",
+      };
+      const setupOutputs = Object.fromEntries(
+        ["gradle-java-home", "gradle-java-version"].map((key) => [
+          key,
+          String(
+            evaluateWorkflowExpression(action.outputs[key].value, {
+              ...context,
+              steps: { "gradle-java": { outputs: gradleJavaOutputs } },
+            }),
+          ),
+        ]),
+      );
       writeExecutable(path.join(root, "date"), [
         "#!/usr/bin/env node",
         'const fs = require("node:fs");',
@@ -5413,7 +5601,7 @@ require("node:fs").writeFileSync("scheduler-baseline", process.env.OPENCLAW_UPGR
       ]);
       writeExecutable(path.join(root, "gradlew"), [
         "#!/usr/bin/env node",
-        'require("node:fs").appendFileSync(process.env.GRADLE_CALLS, JSON.stringify(process.argv.slice(2)) + "\\n");',
+        'require("node:fs").appendFileSync(process.env.GRADLE_CALLS, JSON.stringify({ args: process.argv.slice(2), javaHome: process.env.JAVA_HOME }) + "\\n");',
         "if (process.argv.includes(process.env.FAIL_GRADLE_TASK)) process.exit(23);",
       ]);
       const result = runWorkflowShellScript(expectDefined(step.run, "Android commands"), {
@@ -5421,10 +5609,22 @@ require("node:fs").writeFileSync("scheduler-baseline", process.env.OPENCLAW_UPGR
         cwd: root,
         env: {
           ...process.env,
+          JAVA_HOME: path.join(root, "sdk jdk 17"),
           ...Object.fromEntries(
             Object.entries(step.env ?? {}).map(([key, value]) => [
               key,
-              String(evaluateWorkflowExpression(value, { ...context, matrix: row })),
+              String(
+                evaluateWorkflowExpression(value, {
+                  ...context,
+                  matrix: row,
+                  steps: {
+                    ...context.steps,
+                    [expectDefined(setupStep.id, "Android toolchain step id")]: {
+                      outputs: setupOutputs,
+                    },
+                  },
+                }),
+              ),
             ]),
           ),
           GITHUB_EVENT_NAME: context.eventName,
@@ -5435,12 +5635,14 @@ require("node:fs").writeFileSync("scheduler-baseline", process.env.OPENCLAW_UPGR
           PATH: `${root}${path.delimiter}${process.env.PATH}`,
         },
       });
-      const calls: string[][] = existsSync(callsPath)
+      const invocations: Array<{ args: string[]; javaHome: string }> = existsSync(callsPath)
         ? readFileSync(callsPath, "utf8")
             .trim()
             .split("\n")
             .map((line) => JSON.parse(line))
         : [];
+      const calls = invocations.map(({ args }) => args);
+      expect(invocations.map(({ javaHome }) => javaHome)).toEqual(calls.map(() => gradleJavaHome));
       const clockReads = existsSync(clockPath)
         ? readFileSync(clockPath, "utf8").trim().split("\n")
         : [];
@@ -6485,11 +6687,11 @@ setImmediate(() => {
       ...expectedHostedRunners,
       "security-fast": "blacksmith-4vcpu-ubuntu-2404",
       android: "blacksmith-8vcpu-ubuntu-2404",
-      "build-artifacts": "blacksmith-16vcpu-ubuntu-2404",
+      "build-artifacts": "blacksmith-32vcpu-ubuntu-2404",
       "checks-node-core-test-nondist-shard": "blacksmith-32vcpu-ubuntu-2404",
       "checks-ui-e2e": "blacksmith-8vcpu-ubuntu-2404",
       "checks-ui-e2e-real-gateway": "blacksmith-32vcpu-ubuntu-2404",
-      "docker-seed-e2e": "blacksmith-32vcpu-ubuntu-2404",
+      "docker-seed-e2e": "blacksmith-16vcpu-ubuntu-2404",
       "qa-smoke-ci-profile": "blacksmith-16vcpu-ubuntu-2404",
       "check-test-types-hosted-core-shard": "blacksmith-32vcpu-ubuntu-2404",
       "checks-ui": "blacksmith-8vcpu-ubuntu-2404",
@@ -8801,7 +9003,7 @@ server.listen(0, "127.0.0.1", () => {
     expect(source).toContain("createNodeTestShardBundles");
     const artifactRunner = workflow.jobs["build-artifacts"]["runs-on"];
     for (const [frozenTarget, expected] of [
-      ["false", "blacksmith-16vcpu-ubuntu-2404"],
+      ["false", "blacksmith-32vcpu-ubuntu-2404"],
       ["true", "blacksmith-32vcpu-ubuntu-2404"],
       ["", "blacksmith-32vcpu-ubuntu-2404"],
     ] as const) {
@@ -8867,7 +9069,7 @@ server.listen(0, "127.0.0.1", () => {
     expect(readFrozenAdditionalCheckRows()).toContainEqual({
       check_name: "check-additional-runtime-topology-architecture",
       group: "runtime-topology-architecture",
-      runner: "blacksmith-32vcpu-ubuntu-2404",
+      runner: "blacksmith-16vcpu-ubuntu-2404",
     });
     expect(readFrozenAdditionalCheckRows()).toContainEqual({
       check_name: "check-session-accessor-boundary",
@@ -9171,12 +9373,13 @@ server.listen(0, "127.0.0.1", () => {
     expect(runStep.run).not.toMatch(/\bretry\b/iu);
   });
 
-  it("retains Android test XML after failures without collecting caches or canceled jobs", () => {
+  it("retains Android test XML and JVM diagnostics after failures without collecting caches or canceled jobs", () => {
     const steps = readCiWorkflow().jobs.android.steps as WorkflowStep[];
     const runIndex = steps.findIndex((step) => step.name === "Run Android ${{ matrix.task }}");
     const uploadIndex = steps.findIndex((step) => step.name === "Upload Android test reports");
     const upload = expectDefined(steps[uploadIndex], "Android test reports");
     expect(uploadIndex).toBeGreaterThan(runIndex);
+    expect(upload.with?.["retention-days"]).toBe(14);
     // A status function prevents Actions' implicit success() from hiding failed-test evidence.
     expect(upload.if).toMatch(/\b(?:always|cancelled|failure|success)\(\)/u);
     for (const [task, failed, cancelled, expected] of [
@@ -9209,6 +9412,12 @@ server.listen(0, "127.0.0.1", () => {
       "apps/android/app/build/test-results/testThirdPartyDebugUnitTest/TEST-ThirdParty.xml",
       "apps/android/wear/build/test-results/testDebugUnitTest/TEST-Wear.xml",
       "apps/android/wear-shared/build/test-results/testDebugUnitTest/TEST-Shared.xml",
+      "apps/android/hs_err_pid101.log",
+      "apps/android/replay_pid101.log",
+      "apps/android/app/hs_err_pid202.log",
+      "apps/android/app/replay_pid202.log",
+      "apps/android/wear/hs_err_pid303.log",
+      "apps/android/wear-shared/replay_pid404.log",
     ];
     const unrelated = [
       "apps/android/app/build/test-results/testPlayDebugUnitTest/binary/results.bin",
@@ -9216,6 +9425,11 @@ server.listen(0, "127.0.0.1", () => {
       "apps/android/app/build/outputs/apk/play/debug/app.apk",
       "apps/android/benchmark/build/test-results/testDebugUnitTest/TEST-Benchmark.xml",
       ".gradle/caches/TEST-cached.xml",
+      ".gradle/caches/hs_err_pid505.log",
+      "hs_err_pid606.log",
+      "replay_pid606.log",
+      "apps/android/app/core.202",
+      "apps/android/app/java_pid202.hprof",
     ];
     for (const file of [...reports, ...unrelated]) {
       mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
@@ -13045,6 +13259,11 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
       selectedJobs: ["macos-node", "checks-windows"],
     },
     {
+      label: "Android toolchain action",
+      changedPath: ".github/actions/setup-android-toolchain/action.yml",
+      selectedJobs: ["android"],
+    },
+    {
       label: "Docs Agent",
       changedPath: ".github/workflows/docs-agent.yml",
       selectedJobs: ["macos-node", "checks-windows"],
@@ -13214,6 +13433,16 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
       expect(
         JSON.parse(expectDefined(manifest.outputs.checks_windows_matrix, "Windows matrix")).include,
       ).toHaveLength(selectedJobs.includes("checks-windows") ? 2 : 0);
+      if (eventName === "pull_request" && selectedJobs.includes("android")) {
+        expect(
+          JSON.parse(expectDefined(preflightOutputs.android_matrix, "Android matrix")).include,
+        ).toEqual([
+          { check_name: "android-test-play", task: "test-play", lint: true },
+          { check_name: "android-test-third-party", task: "test-third-party", lint: true },
+          { check_name: "android-test-wear", task: "test-wear", lint: true },
+          { check_name: "android-ktlint", task: "ktlint" },
+        ]);
+      }
     },
   );
 
