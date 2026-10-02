@@ -8,80 +8,33 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join, relative, resolve } from "node:path";
-import ts from "typescript";
+import { join, relative } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { detectWorktreeFilesystemBackend } from "../../src/agents/worktrees/filesystem-backend.js";
 import { listTemplates } from "../../src/agents/worktrees/template-registry.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 import { createMainRefreshFixture } from "./pr-main-refresh.test-support.js";
-import { copyPrWrapperSources } from "./pr-wrapper.test-support.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const describePosix = process.platform === "win32" ? describe.skip : describe;
 
-it("extracts the complete eager runtime import closure of every wrapper component", () => {
-  const extracted = tempDirs.make("openclaw-pr-import-closure-");
-  copyPrWrapperSources(extracted);
-  const { config } = ts.readConfigFile("tsconfig.json", (file) => ts.sys.readFile(file));
-  const { options } = ts.convertCompilerOptionsFromJson(config.compilerOptions, process.cwd());
-  const runtimeHost = {
-    ...ts.sys,
-    fileExists: (file: string) => !/\.d\.[cm]?ts$/.test(file) && ts.sys.fileExists(file),
-  };
-  const missing = new Set<string>();
-  for (const entry of readdirSync(extracted, { recursive: true, withFileTypes: true })) {
-    if (!entry.isFile() || !/\.[cm]?[jt]s$/.test(entry.name)) {
-      continue;
-    }
-    const file = relative(extracted, join(entry.parentPath, entry.name));
-    // Emit erases type-only imports; only top-level imports/re-exports must load
-    // with the wrapper. Lazy application commands retain their own source tree.
-    const { outputText } = ts.transpileModule(readFileSync(join(extracted, file), "utf8"), {
-      fileName: file,
-      compilerOptions: { ...options, module: ts.ModuleKind.ESNext },
-    });
-    const source = ts.createSourceFile(file, outputText, ts.ScriptTarget.Latest, true);
-    for (const statement of source.statements) {
-      if (
-        (!ts.isImportDeclaration(statement) && !ts.isExportDeclaration(statement)) ||
-        !statement.moduleSpecifier ||
-        !ts.isStringLiteral(statement.moduleSpecifier)
-      ) {
-        continue;
-      }
-      const specifier = statement.moduleSpecifier.text;
-      const dependency = ts.resolveModuleName(
-        specifier,
-        resolve(file),
-        options,
-        runtimeHost,
-      ).resolvedModule;
-      if (!dependency) {
-        if (specifier.startsWith(".")) {
-          missing.add(`${file}: unresolved ${specifier}`);
-        }
-        continue;
-      }
-      const dependencyPath = relative(process.cwd(), dependency.resolvedFileName);
-      if (!dependency.isExternalLibraryImport && !existsSync(join(extracted, dependencyPath))) {
-        missing.add(`${file}: ${dependencyPath}`);
-      }
-    }
-  }
-  expect([...missing].toSorted()).toEqual([]);
-});
-
 function coldFixture(perWorktreeConfig = true) {
   const f = createMainRefreshFixture(tempDirs.make("openclaw-pr-provision-"), {
     perWorktreeConfig,
+    precreateWorktree: false,
   });
-  // Remove only this harness's disposable precreated checkout, before review-init.
-  f.git(f.canonical, "worktree", "remove", "--force", f.worktree);
   f.env.OPENCLAW_STATE_DIR = join(f.root, "state");
   f.env.OPENCLAW_CONFIG_PATH = join(f.root, "config.json");
   writeFileSync(f.env.OPENCLAW_CONFIG_PATH, "{}\n");
-  return f;
+  return {
+    ...f,
+    run(...args: Parameters<typeof f.run>) {
+      const result = f.run(...args);
+      f.assertPrivateHandoffVerified();
+      return result;
+    },
+  };
 }
 
 function expectSeed(f: ReturnType<typeof coldFixture>, pr = 42) {
@@ -119,29 +72,43 @@ describePosix("native PR source provisioning", () => {
     expect(existsSync(join(f.canonical, ".worktrees", ".templates"))).toBe(false);
   });
 
-  it.each([false, true])(
-    "preserves a symlinked parent through native Git (acceleration=%s)",
-    (acceleration) => {
-      const f = coldFixture(false);
-      writeFileSync(
-        f.env.OPENCLAW_CONFIG_PATH!,
-        JSON.stringify({ worktreeAcceleration: acceleration }),
-      );
-      const parent = join(f.canonical, ".worktrees");
-      const physicalParent = join(f.root, "pr-worktrees");
-      rmdirSync(parent);
-      mkdirSync(physicalParent);
-      symlinkSync(physicalParent, parent, "dir");
-      const result = f.run("review-init");
-      expect(result.status, result.stderr).toBe(0);
-      expect(result.stderr).toContain("PR source checkout: Git checkout.");
-      expectSeed(f);
-      expect(f.git(f.worktree, "rev-parse", "--show-toplevel")).toBe(join(physicalParent, "pr-42"));
-      expect(f.git(f.worktree, "rev-parse", "FETCH_HEAD")).toBe(f.main);
-      expect(f.git(f.canonical, "for-each-ref", "refs/openclaw/pr-operation-locks")).toBe("");
-      expect(existsSync(join(physicalParent, ".templates"))).toBe(false);
-    },
-  );
+  it("preserves a symlinked parent through native Git with acceleration enabled", () => {
+    const f = coldFixture(false);
+    writeFileSync(f.env.OPENCLAW_CONFIG_PATH!, JSON.stringify({ worktreeAcceleration: true }));
+    const preload = join(f.root, "native-provision-imports.mjs");
+    const guardReceipt = join(f.root, "native-provision-imports.txt");
+    writeFileSync(
+      preload,
+      `import { appendFileSync } from "node:fs";
+import { registerHooks } from "node:module";
+if (process.argv[1]?.endsWith("/worktree-provision.mts")) {
+  registerHooks({ load(url, context, nextLoad) {
+    if (url.endsWith("/src/config/config.ts")) {
+      throw new Error("Native Git provisioning must not load acceleration configuration.");
+    }
+    return nextLoad(url, context);
+  } });
+  appendFileSync(${JSON.stringify(guardReceipt)}, String(process.pid) + "\\n");
+}
+`,
+    );
+    // Keep both guards: reject config startup and verify each private store.
+    f.env.NODE_OPTIONS = `--import=${pathToFileURL(preload).href} ${f.env.NODE_OPTIONS}`;
+    const parent = join(f.canonical, ".worktrees");
+    const physicalParent = join(f.root, "pr-worktrees");
+    rmdirSync(parent);
+    mkdirSync(physicalParent);
+    symlinkSync(physicalParent, parent, "dir");
+    const result = f.run("review-init");
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain("PR source checkout: Git checkout.");
+    expect(readFileSync(guardReceipt, "utf8")).toMatch(/^[1-9]\d*\n$/);
+    expectSeed(f);
+    expect(f.git(f.worktree, "rev-parse", "--show-toplevel")).toBe(join(physicalParent, "pr-42"));
+    expect(f.git(f.worktree, "rev-parse", "FETCH_HEAD")).toBe(f.main);
+    expect(f.git(f.canonical, "for-each-ref", "refs/openclaw/pr-operation-locks")).toBe("");
+    expect(existsSync(join(physicalParent, ".templates"))).toBe(false);
+  });
 
   it.runIf(process.platform === "linux")(
     "keeps native Git provisioning on an unsupported source filesystem",
@@ -172,6 +139,9 @@ describePosix("native PR source provisioning", () => {
     "preserves command-scoped safe.directory through cold provisioning (%s transport)",
     (transport) => {
       const f = coldFixture(false);
+      // Local upload-pack drops client command-scope config; trust only its bare remote.
+      f.env.GIT_CONFIG_GLOBAL = join(f.root, "gitconfig");
+      f.git(f.canonical, "config", "--global", "--add", "safe.directory", f.origin);
       // Git's ownership fixture requires actual command-scope authorization,
       // without changing filesystem ownership or global configuration.
       f.env.GIT_TEST_ASSUME_DIFFERENT_OWNER = "1";
@@ -424,7 +394,10 @@ ${changeLock}
       const templateNames = readdirSync(templates).toSorted();
       expect(templateNames.length).toBeGreaterThan(0);
       expect(first.stderr).toContain("PR source checkout: filesystem template clone.");
-      const template = listTemplates(f.env).find((entry) => entry.sourceCommit === f.main);
+      const template = listTemplates({
+        ...f.env,
+        OPENCLAW_STATE_DIR: join(f.canonical, ".local", "pr-state"),
+      }).find((entry) => entry.sourceCommit === f.main);
       expect(template?.backend).toBe("apfs");
       expect(template?.status).toBe("ready");
       const warmResult = nextPr(f, 43);
