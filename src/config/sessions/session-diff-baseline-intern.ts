@@ -14,7 +14,7 @@
 // fresh copies, and freezing turns a future in-place write into a loud TypeError instead
 // of silent cross-entry aliasing.
 
-export type SessionDiffBaselineFileRecord = { path: string; fingerprint: string };
+type SessionDiffBaselineFileRecord = { path: string; fingerprint: string };
 
 // One live checkout's tracked-file count, with room for a rename wave. A checkout past
 // this size trips the baseline's own truncation caps long before the map matters.
@@ -63,6 +63,7 @@ export function internSessionEntryDiffBaseline(entry: {
     if (!file || typeof file !== "object") {
       continue;
     }
+    // SAFETY: file is a non-null object; both fields are re-validated as strings below.
     const { fingerprint, path } = file as Partial<SessionDiffBaselineFileRecord>;
     if (typeof path !== "string" || typeof fingerprint !== "string") {
       continue;
