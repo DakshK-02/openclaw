@@ -40,7 +40,7 @@ export function projectPluginSessionEntry(entry: InternalSessionEntry): SessionE
     // Stored baselines share one frozen record per checkout file across every parsed row.
     // Plugin results are owned, so detach them here the way restartRecoveryRuns is detached.
     ...(baseline?.files
-      ? { sessionDiffBaseline: { ...baseline, files: baseline.files.map((file) => ({ ...file })) } }
+      ? { sessionDiffBaseline: { ...baseline, files: structuredClone(baseline.files) } }
       : {}),
   };
 }

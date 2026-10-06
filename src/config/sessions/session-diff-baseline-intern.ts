@@ -36,7 +36,9 @@ export function internDiffBaselineFile(
     internedFiles.set(path, existing);
     return existing;
   }
-  const adopted = Object.freeze({ fingerprint, path });
+  // Key order matches the canonical stored shape so re-serializing an entry that holds an
+  // interned record reproduces the original snapshot bytes.
+  const adopted = Object.freeze({ path, fingerprint });
   // A changed fingerprint replaces the record; entries already holding the old one keep it.
   internedFiles.delete(path);
   internedFiles.set(path, adopted);
