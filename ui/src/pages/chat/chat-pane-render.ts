@@ -13,7 +13,7 @@ import { personActivityRouting } from "../../components/person-activity-link.ts"
 import { isCloudWorkerPlacementState } from "../../components/session-row-badges.ts";
 import { t } from "../../i18n/index.ts";
 import { isModelIndependentChatCommand } from "../../lib/chat/commands.ts";
-import { isGatewayMethodAdvertised } from "../../lib/gateway-methods.ts";
+import { canCallGatewayMethod, isGatewayMethodAdvertised } from "../../lib/gateway-methods.ts";
 import {
   pickFreshestObserverDigest,
   projectSessionObserverDigest,
@@ -284,7 +284,8 @@ export class ChatPane extends ChatPaneLayoutRender {
     if (
       !publicationScope ||
       !publicationRow ||
-      !isGatewayMethodAdvertised(gatewaySnapshot, "sessions.github.publish")
+      isGatewayMethodAdvertised(gatewaySnapshot, "sessions.github.publish") !== true ||
+      !canCallGatewayMethod(gatewaySnapshot, "sessions.github.options", "operator.read")
     ) {
       this.githubPublication?.detach();
       this.githubPublication = null;
@@ -336,13 +337,13 @@ export class ChatPane extends ChatPaneLayoutRender {
           !(selectedSessionArchived || restartRecoveryTombstoned || placementComposer.blocksSend) &&
           (!pendingReason || initialHistoryUnavailable));
     const composerAvailability = {
-      canCompose: composerAccess.canCompose && composerAvailable,
-      canSend: composerAccess.canSend && composerAvailable,
+      canCompose: composerAccess && composerAvailable,
+      canSend: composerAccess && composerAvailable,
       ...chatSubmitState(state, initialHistoryUnavailable, !catalog && !suggestionViewer),
       modelRequiredReason,
       disabledReason:
         catalogDisabledReason ??
-        (!composerAccess.canSend ? t("chat.sessionSharing.scopeReadOnlyNotice") : null) ??
+        (!composerAccess ? t("chat.sessionSharing.scopeReadOnlyNotice") : null) ??
         disabledReason ??
         placementComposer.busyMessage ??
         (placementComposer.state.kind === "failed" && !placementComposer.state.recoveryAction
@@ -350,7 +351,7 @@ export class ChatPane extends ChatPaneLayoutRender {
           : null) ??
         (state.connected && (placementStartup || initialHistoryUnavailable) ? null : pendingReason),
       disabledReasonTone:
-        !composerAccess.canSend ||
+        !composerAccess ||
         disabledReason ||
         placementComposer.busyMessage ||
         (sessionParticipationBlocked && !suggestionViewer)
@@ -658,7 +659,7 @@ export class ChatPane extends ChatPaneLayoutRender {
       agentsList: state.agentsList,
       currentAgentId,
       fullMessageAgentId: scopedAgentParamsForSession(state, state.sessionKey).agentId,
-      loadFullAssistantMessage: createSidebarFullMessageLoader(state, catalog),
+      loadFullAssistantMessage: createSidebarFullMessageLoader(state, this.context.gateway),
       onSessionSelect: (next) => this.onPaneSessionChange?.(this.paneId, next),
       canvasPluginSurfaceUrl: state.canvasPluginSurfaceUrl,
       boardProvider: board.provider,

@@ -23,8 +23,8 @@ import {
 } from "./session-entry-json.js";
 import {
   attachSessionEntrySnapshots,
-  sessionEntrySnapshotColumns,
   sessionEntrySnapshotColumnsForKeys,
+  type SessionEntryProjection,
   type SessionEntrySnapshotRow,
 } from "./session-entry-snapshots.js";
 import { projectCanonicalSessionEntryShape } from "./store-entry-shape.js";
@@ -32,7 +32,7 @@ import type { SessionEntry } from "./types.js";
 
 export function selectSessionEntryRows(
   database: Pick<OpenClawAgentDatabase, "db">,
-  projection: "full" | "list",
+  projection: SessionEntryProjection,
   fullEntryKeys: readonly string[] = [],
   // Prepared readers pass the column shape from this operation's fresh schema check.
   ownerColumns?: boolean,
@@ -41,11 +41,11 @@ export function selectSessionEntryRows(
     .selectFrom("session_nodes")
     .select("session_key")
     .select("entry_json")
-    .$if(projection === "full" || fullEntryKeys.length > 0, (query) =>
+    .$if(projection !== "list" || fullEntryKeys.length > 0, (query) =>
       query.select(
-        projection === "full"
-          ? sessionEntrySnapshotColumns
-          : sessionEntrySnapshotColumnsForKeys(fullEntryKeys),
+        projection === "list"
+          ? sessionEntrySnapshotColumnsForKeys(fullEntryKeys)
+          : sessionEntrySnapshotColumnsForKeys(undefined, projection),
       ),
     )
     .$if(ownerColumns ?? hasSqliteSessionOwnerColumns(database.db), (query) =>
@@ -89,20 +89,13 @@ export function parseSessionEntryJson(
     updated_at?: number;
   } & SqliteSessionOwnerRow &
     SessionEntrySnapshotRow,
-  projection: "full" | "list" = "full",
+  projection: SessionEntryProjection = "full",
 ): SessionEntry | null {
   const record = parseSqliteSessionEntryRecord(row);
   if (!record) {
     return null;
   }
-  if (projection === "list") {
-    // Rejected legacy rows may retain unsplit fields; metadata views still omit them.
-    delete record.sessionDiffBaseline;
-    delete record.skillsSnapshot;
-    delete record.systemPromptReport;
-  } else {
-    attachSessionEntrySnapshots(record, row);
-  }
+  attachSessionEntrySnapshots(record, row, projection);
   const entry = projectSqliteSessionOwner(projectCanonicalSessionEntryShape(record), row);
   // Sessions on one host baseline the same checkout, so without this every parsed row holds
   // its own copy of every file record. Interning here covers all callers rather than
@@ -144,18 +137,15 @@ export function readSessionEntriesByStatus(
   if (selectedStatuses.length === 0) {
     return [];
   }
-  const db = getNodeSqliteKysely<OpenClawAgentKyselyDatabase>(database.db);
-  let query = db
-    .selectFrom("session_nodes")
-    .selectAll()
-    .select(sessionEntrySnapshotColumns)
+  let query = selectSessionEntryRows(database, "list")
+    .select(["current_session_id", "updated_at"])
     .where("status", "in", projectedStatuses);
   if (sessionKeys) {
     query = query.where("session_key", "in", sqliteStringSet(sessionKeys));
   }
   return executeSqliteQuerySync(database.db, query)
     .rows.flatMap((row) => {
-      const entry = parseSessionEntryJson(row);
+      const entry = parseSessionEntryJson(row, "list");
       return entry?.status && selectedStatuses.includes(entry.status)
         ? [{ entry, sessionKey: row.session_key }]
         : [];
